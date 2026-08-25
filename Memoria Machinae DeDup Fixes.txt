@@ -1,0 +1,160 @@
+"""
+memory/stack.py
+
+The consolidation pass: periodically scans active memories and merges
+near-duplicate nodes into each other based on cosine similarity between
+their embeddings. Contains the fixes for bug #4 and bug #8.
+
+    Bug #4 (zero-embedding NaN) — see the note on cosine_similarity()
+    below; unchanged from the previous fix.
+
+    Bug #8 — O(n^2) pairwise similarity comparison at scale. The
+    original merge-dedup pass compared every "active" node against
+    every other active node with a plain nested Python loop:
+
+        for i, node_a in enumerate(active):
+            for node_b in active[i + 1:]:
+                sim = cosine_similarity(node_a.embedding, node_b.embedding)
+                ...
+
+    This is O(n^2) similarity computations per consolidation pass. The
+    hardware/scale guidance for this system anticipates millions of
+    memories; even at a modest 10,000 active nodes that's ~50 million
+    pairwise comparisons *every consolidation cycle*, almost all of
+    which are wasted work comparing embeddings that are nowhere near
+    each other in vector space. The system already has FAISS-backed
+    ANN infrastructure elsewhere (VectorStore) for exactly this kind of
+    problem; the merge-dedup pass wasn't using it.
+
+    The fix replaces the brute-force double loop with a KD-tree
+    (scipy.spatial.cKDTree) built once per consolidation pass over
+    L2-normalized embeddings. For unit vectors, Euclidean distance is a
+    monotonic function of cosine similarity
+    (||a - b||^2 = 2 - 2*cos_sim), so a cosine similarity threshold
+    converts *exactly* — not approximately — into a Euclidean search
+    radius. This means the tree-based approach finds precisely the same
+    candidate pairs a brute-force scan would, in average O(n log n)
+    instead of O(n^2), and each candidate is still verified with the
+    exact cosine_similarity() function before merging (belt-and-braces
+    against any floating-point edge case at the radius boundary). If
+    your deployment already has a FAISS-backed VectorStore, swapping
+    the cKDTree here for a call into that store is a drop-in
+    replacement of _find_merge_pairs(); the important part is that
+    dedup is no longer literally quadratic in the number of active
+    nodes.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+from ..config import CONFIG
+from ..memory.graph import EpisodicNode, MemoryGraph
+from ..metrics import CONSOLIDATION_MERGE_COUNT, CONSOLIDATION_SKIPPED_NONMEANINGFUL_COUNT
+
+# Matches the epsilon used elsewhere in the codebase (e.g. salience.py)
+# for normalizing embeddings that may be zero or near-zero.
+_COSINE_EPSILON = 1e-8
+
+
+def _normalize_embedding(embedding) -> np.ndarray:
+    """L2-normalize an embedding, safe against zero or near-zero
+    vectors. Shared by cosine_similarity() and the KD-tree candidate
+    search below so the two can never define "normalized" differently
+    and drift apart the way similarly-duplicated parsing logic did in
+    earlier bugs (#1 / #2) in this codebase.
+    """
+    emb = np.asarray(embedding, dtype=float)
+    return emb / (np.sqrt(emb @ emb) + _COSINE_EPSILON)
+
+
+def cosine_similarity(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
+    """Cosine similarity between two embeddings, safe against zero or
+    near-zero vectors (bug #4 fix). Never raises, never returns
+    nan/inf: a zero vector normalizes to the zero vector, which has
+    similarity 0.0 against anything (including another zero vector).
+    """
+    return float(_normalize_embedding(emb_a) @ _normalize_embedding(emb_b))
+
+
+def _cosine_threshold_to_euclidean_radius(threshold: float) -> float:
+    """Convert a cosine similarity threshold into the Euclidean search
+    radius that finds exactly the same pairs, for L2-normalized (unit)
+    vectors: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a.b = 2 - 2*cos_sim.
+    So cos_sim >= threshold  <=>  ||a - b|| <= sqrt(2 - 2*threshold).
+    """
+    threshold = min(1.0, max(-1.0, threshold))
+    return math.sqrt(max(0.0, 2.0 * (1.0 - threshold)))
+
+
+def _find_merge_pairs(nodes: list[EpisodicNode], threshold: float) -> list[tuple[int, int]]:
+    """Return (i, j) index pairs (i < j, ascending order — matching the
+    order a brute-force nested loop would produce) whose embeddings
+    have cosine similarity >= threshold, without ever comparing every
+    node against every other node.
+    """
+    if len(nodes) < 2:
+        return []
+
+    normalized = np.stack([_normalize_embedding(n.embedding) for n in nodes])
+    tree = cKDTree(normalized)
+    radius = _cosine_threshold_to_euclidean_radius(threshold)
+
+    pairs: list[tuple[int, int]] = []
+    for i in range(len(nodes)):
+        neighbor_indices = sorted(tree.query_ball_point(normalized[i], r=radius))
+        for j in neighbor_indices:
+            if j <= i:
+                continue
+            # Exact verification guards against any tiny floating-point
+            # discrepancy between the Euclidean-radius approximation
+            # and the true cosine threshold at the boundary.
+            sim = cosine_similarity(nodes[i].embedding, nodes[j].embedding)
+            if sim >= threshold:
+                pairs.append((i, j))
+    return pairs
+
+
+class MemoryStack:
+    """Owns the consolidation pass over a MemoryGraph: near-duplicate
+    detection and merging of active memory nodes."""
+
+    def __init__(self, graph: MemoryGraph, config: dict | None = None):
+        self.graph = graph
+        self._config = config or CONFIG
+        self._threshold = self._config["dedup_similarity_threshold"]
+
+    def consolidate(self) -> int:
+        """Scan active nodes (those with a meaningful embedding) and
+        merge any pair whose cosine similarity meets the configured
+        threshold, using KD-tree candidate search instead of an
+        O(n^2) brute-force scan (bug #8 fix). Returns the number of
+        merges performed.
+        """
+        considered: list[EpisodicNode] = []
+        for node in self.graph.all_nodes():
+            if node.embedding is None:
+                continue
+            if not node.embedding_meaningful:
+                CONSOLIDATION_SKIPPED_NONMEANINGFUL_COUNT.inc()
+                continue
+            considered.append(node)
+
+        merge_count = 0
+        if len(considered) < 2:
+            return merge_count
+
+        merged_ids: set[str] = set()
+        for i, j in _find_merge_pairs(considered, self._threshold):
+            node_a, node_b = considered[i], considered[j]
+            if node_a.node_id in merged_ids or node_b.node_id in merged_ids:
+                continue
+            self.graph.merge_nodes(node_a.node_id, node_b.node_id)
+            merged_ids.add(node_b.node_id)
+            merge_count += 1
+            CONSOLIDATION_MERGE_COUNT.inc()
+
+        return merge_count
